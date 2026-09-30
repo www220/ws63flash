@@ -99,6 +99,9 @@ static inline int ymodem_wait_ack(int fd)
 	int ret;
 
 	while (1) {
+		if (difftime(time(NULL), t0) > YMODEM_ACK_TIMEOUT)
+			return EAGAIN;
+
 		ret = read(fd, &cc, 1);
 
 		if (ret == 0) continue;
@@ -111,9 +114,6 @@ static inline int ymodem_wait_ack(int fd)
 			return 0;
 
 		if (cc == NAK)
-			return EAGAIN;
-
-		if (difftime(time(NULL), t0) > YMODEM_ACK_TIMEOUT)
 			return EAGAIN;
 	}
 }
@@ -166,7 +166,7 @@ blk_xmit:
 static inline int
 ymodem_xfer(int fd, FILE *f, const char *fn, size_t len, int verbose)
 {
-        int total_blk = ceil(len/1024.0), i_blk = 0;
+	int total_blk = ceil(len/1024.0), i_blk = 0;
 	uint8_t blkbuf[1029], cc, occ;
 	size_t last_blk = (last_blk = len - ((len/1024)*1024)) ? last_blk : 1024;
 	time_t t0 = time(NULL);

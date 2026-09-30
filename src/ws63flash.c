@@ -56,6 +56,7 @@ static char	doc[]	   = PACKAGE " -- flashing utility for Hisilicon WS63";
 static char	args_doc[] =
 	"--flash TTY FWPKG [BIN...]\n"
 	"--write TTY LOADERBOOT [BIN@ADDR...]\n"
+	"--slink TTY UPG_FWPKG\n"
 	"--write-program TTY BIN\n"
 	"--erase TTY FWPKG";
 
@@ -66,6 +67,8 @@ static struct argp_option options[] = {
 	 "erase the flash memory", 0},
 	{"write", 'w', 0, 0,
 	 "write bin(s) to specific address", 0},
+	{"slink", 3, 0, 0,
+	 "slink a upg_fwpkg file", 0},
 	{"write-program", 2, 0, 0,
 	 "write a machine code binary", 0},
 
@@ -129,6 +132,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 	case 'f':
 	case 'w':
 	case 'e':
+	case 3:
 	case 2:
 		if (args->verb)
 			argp_usage(state); /* Verb already set, Bail out */
@@ -138,6 +142,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		if ((args->verb == 'f' && state->arg_num >= MAX_PARTITION_CNT)
 		    || (args->verb == 'w' && state->arg_num >= MAX_PARTITION_CNT)
 		    || (args->verb == 'e' && state->arg_num > 0)
+		    || (args->verb == 3 && state->arg_num >= MAX_PARTITION_CNT)
 		    || (args->verb == 2   && state->arg_num > 1))
 			argp_usage(state);
 		args->args[state->arg_num] = arg;
@@ -147,6 +152,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		if ((args->verb == 'f' && state->arg_num < 2)
 		    || (args->verb == 'w' && state->arg_num < 3)
 		    || (args->verb == 'e' && state->arg_num < 1)
+		    || (args->verb == 3 && state->arg_num < 2)
 		    || (args->verb == 2   && state->arg_num < 2))
 			argp_usage(state);
 		break;
@@ -404,6 +410,116 @@ int verb_flash(int fd) {
 	if (ws63_poll_reset(fd, arguments.verbose) < 0)
 		perror("ws63_poll_reset");
 
+	return 0;
+}
+
+int verb_slink(int fd) {
+	uint8_t *needle = NULL;
+	time_t t0, t1;
+	int ret;
+
+	FILE	*binf	= fopen(arguments.args[1], "r");
+	size_t	 binlen = 0;
+
+	if (!binf) {
+		perror(arguments.args[1]);
+		return 1;
+	}
+
+	char ver_info[20] = {0};
+	if (fseek(binf, 0x150, SEEK_SET) != 0) {
+		perror(arguments.args[1]);
+		return 1;
+	}
+	if (fread(ver_info, 1, 16, binf) != 16) {
+		perror(arguments.args[1]);
+		return 1;
+	}
+	fseek(binf, 0, SEEK_END);
+	binlen = ftell(binf);
+	fseek(binf, 0, SEEK_SET);
+
+	printf("Waiting for device ready...\n");
+	t0 = time(NULL);
+	while (!needle) {
+		uint8_t buf[1024];
+		size_t written = 0;
+
+		/* AT CMD */
+		size_t total_bytes = sprintf(buf, "AT+SLINKUPG=%d,%s,%d\r\n", arguments.baud, ver_info, binlen);
+		while (written < total_bytes) {
+			int wrote = write(fd, buf + written, total_bytes - written);
+			if (wrote < 0) {
+				perror("write");
+				return EXIT_FAILURE;
+			}
+			written += wrote;
+		}
+
+		if (arguments.verbose > 2) {
+			printf("> ");
+			for (int i = 0; i < total_bytes-strlen("\r\n"); i++)
+				printf("%c", buf[i]);
+			printf("\n");
+		}
+
+		if (difftime(time(NULL), t0) > RESET_TIMEOUT * 10) {
+			errno = ETIMEDOUT;
+			perror("Waiting for device ready");
+			return 1;
+		}
+
+		written = 0;
+		t1 = time(NULL);
+		while (true) {
+			if (difftime(time(NULL), t1) > RESET_TIMEOUT || written > 128) {
+				/* AT TimeOut */
+				break;
+			}
+
+			int len = read(fd, &buf[written], 32);
+			if (len == 0) continue;
+			if (len < 0) {
+				perror("read");
+				return EXIT_FAILURE;
+			}
+			written += len;
+			buf[written] = 0;
+
+			/* AT OK */
+			char ack[] = "OK\r\n";
+			needle = memmem(buf, written, ack, sizeof(ack)-1);
+			if (needle) {
+				if (arguments.baud != 115200) uart_open(&fd, NULL, arguments.baud);
+				printf("Establishing ymodem session...\n");
+				break;
+			} else {
+				char ack[] = "ERROR:";
+				needle = memmem(buf, written, ack, sizeof(ack)-1);
+				if (needle) {
+					char ack_cr[] = "\r\n";
+					uint8_t *needl_cr = memmem(needle, written-(needle-buf), ack_cr, sizeof(ack_cr)-1);
+					if (needl_cr) {
+						// 剔除掉无效的\r\n防止影响输出结果
+						*needl_cr = 0;
+						errno = ECONNREFUSED;
+						perror(needle);
+						return EXIT_FAILURE;
+					}
+					needle = NULL;
+				}
+			}
+		}
+	}
+
+	ret = ymodem_xfer(fd, binf,
+			  ver_info,
+			  binlen,
+			  arguments.verbose);
+	if (ret < 0)
+		return EXIT_FAILURE;
+
+	printf("Done. Reseting device...\n");
 	return 0;
 }
 
@@ -666,7 +782,7 @@ int verb_erase(int fd) {
 	uart_read_until_magic(fd, arguments.verbose);
 
 	printf("Done. Reseting device...\n");
-        if (ws63_poll_reset(fd, arguments.verbose) < 0)
+	if (ws63_poll_reset(fd, arguments.verbose) < 0)
 		perror("ws63_poll_reset");
 	return 0;
 }
@@ -883,6 +999,9 @@ int main (int argc, char **argv)
 		break;
 	case 'e':
 		ret = verb_erase(fd);
+		break;
+	case 3:
+		ret = verb_slink(fd);
 		break;
 	case 2:
 		ret = verb_write_prog(fd);
